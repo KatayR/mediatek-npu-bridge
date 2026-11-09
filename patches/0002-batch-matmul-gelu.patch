@@ -1,0 +1,118 @@
+diff --git a/neuron/neuron_delegate_builder.h b/neuron/neuron_delegate_builder.h
+index 7df3937..48f658f 100644
+--- a/neuron/neuron_delegate_builder.h
++++ b/neuron/neuron_delegate_builder.h
+@@ -178,6 +178,10 @@ class NeuronOpBuilder {
+     return AddScalarOperand<int32_t>(value, NEURON_INT32);
+   }
+ 
++  TfLiteStatus AddScalarUInt32Operand(uint32_t value) {
++    return AddScalarOperand<uint32_t>(value, NEURON_UINT32);
++  }
++
+   TfLiteStatus AddScalarFloat32Operand(float value) {
+     return AddScalarOperand<float>(value, NEURON_FLOAT32);
+   }
+diff --git a/neuron/neuron_delegate_kernel.cc b/neuron/neuron_delegate_kernel.cc
+index 2fce2a3..d2107f6 100644
+--- a/neuron/neuron_delegate_kernel.cc
++++ b/neuron/neuron_delegate_kernel.cc
+@@ -960,6 +960,30 @@ TfLiteStatus NeuronDelegateKernel::Map(TfLiteContext* context, int builtin_code,
+       }
+       mapping_args.builder->GetExtensionOperationType(nn_op_type);
+     } break;
++    case kTfLiteBuiltinBatchMatmul: {
++      // npu-stt 0002. Operands: [A, B, BOOL adj_x, BOOL adj_y] -> NEURON_BATCH_MATMUL
++      // (same layout as LiteRT's MediaTek batch_matmul_op_legalization.cc).
++      auto builtin = reinterpret_cast<TfLiteBatchMatMulParams*>(
++          mapping_args.node->builtin_data);
++      mapping_args.builder->AddScalarBoolOperand(builtin->adj_x);
++      mapping_args.builder->AddScalarBoolOperand(builtin->adj_y);
++      *nn_op_type = NEURON_BATCH_MATMUL;
++    } break;
++    case kTfLiteBuiltinGelu: {
++      // npu-stt 0002. Operands: [x, scalar approximate] -> NEURON_GELU_V2
++      // (1 = tanh approximation, as LiteRT and ONNX Runtime's NeuroPilot EP
++      // always pass; 0 = exact, untested). LiteRT passes the scalar as UINT32,
++      // ONNX Runtime's EP as INT32; define NPUSTT_GELU_APPROX_INT32 for the latter.
++      auto builtin =
++          reinterpret_cast<TfLiteGeluParams*>(mapping_args.node->builtin_data);
++#ifdef NPUSTT_GELU_APPROX_INT32
++      mapping_args.builder->AddScalarInt32Operand(builtin->approximate ? 1 : 0);
++#else
++      mapping_args.builder->AddScalarUInt32Operand(builtin->approximate ? 1u
++                                                                        : 0u);
++#endif
++      *nn_op_type = NEURON_GELU_V2;
++    } break;
+     default:
+       // All other operators are not mapped.
+       TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO, "Unmapped OP: %d", builtin_code);
+diff --git a/neuron/neuron_delegate_validation.cc b/neuron/neuron_delegate_validation.cc
+index 49c6aa8..1436e9b 100644
+--- a/neuron/neuron_delegate_validation.cc
++++ b/neuron/neuron_delegate_validation.cc
+@@ -703,6 +703,46 @@ bool Validate(const TfLiteRegistration* registration, const TfLiteNode* node,
+              NeuronValidationFailureType::kUnsupportedOperandValue,
+              "Neuron does not support axis being the last dimension", &val_ctx);
+     } break;
++    case kTfLiteBuiltinBatchMatmul: {
++      // npu-stt 0002: float32 only, equal ranks 2..4, equal batch dims (no
++      // broadcasting), runtime (non-constant) B. A constant B is left to the
++      // CPU: ONNX Runtime's NeuroPilot EP measured garbage output for
++      // NEURON_BATCH_MATMUL with a constant B on MDLA (matmul_op_builder.cc);
++      // export such matmuls as FULLY_CONNECTED instead.
++      ExpectMaxOpVersion(version, 4, &val_ctx);
++      Expect(node->inputs->size == 2,
++             NeuronValidationFailureType::kUnsupportedOperatorVariant,
++             "BATCH_MATMUL needs exactly 2 inputs", &val_ctx);
++      if (node->inputs->size == 2) {
++        const TfLiteTensor& a = context->tensors[node->inputs->data[0]];
++        const TfLiteTensor& b = context->tensors[node->inputs->data[1]];
++        const TfLiteTensor& out = context->tensors[node->outputs->data[0]];
++        Expect(a.type == kTfLiteFloat32 && b.type == kTfLiteFloat32 &&
++                   out.type == kTfLiteFloat32,
++               NeuronValidationFailureType::kUnsupportedInputType,
++               "BATCH_MATMUL: only float32 inputs and output", &val_ctx);
++        const int rank = a.dims->size;
++        Expect(rank >= 2 && rank <= 4 && b.dims->size == rank,
++               NeuronValidationFailureType::kUnsupportedOperandRank,
++               "BATCH_MATMUL: inputs need the same rank, 2 to 4", &val_ctx);
++        bool same_batch = b.dims->size == rank;
++        for (int i = 0; same_batch && i < rank - 2; ++i) {
++          same_batch = a.dims->data[i] == b.dims->data[i];
++        }
++        Expect(same_batch, NeuronValidationFailureType::kUnsupportedOperandSize,
++               "BATCH_MATMUL: batch dimensions must match (no broadcasting)",
++               &val_ctx);
++        Expect(b.allocation_type != kTfLiteMmapRo,
++               NeuronValidationFailureType::kUnsupportedOperandValue,
++               "BATCH_MATMUL: constant B is not delegated (use FULLY_CONNECTED)",
++               &val_ctx);
++      }
++    } break;
++    case kTfLiteBuiltinGelu: {
++      // npu-stt 0002: float32 only (v1); mapped to NEURON_GELU_V2.
++      ExpectMaxOpVersion(version, 1, &val_ctx);
++      ExpectIsFloatOperator(context, node, &val_ctx);
++    } break;
+     case kTfLiteBuiltinSquaredDifference:
+     case kTfLiteBuiltinRsqrt:
+     case kTfLiteBuiltinMirrorPad:
+diff --git a/neuron/neuron_types.h b/neuron/neuron_types.h
+index 2d26c0f..d23b2bc 100644
+--- a/neuron/neuron_types.h
++++ b/neuron/neuron_types.h
+@@ -245,6 +245,12 @@ typedef enum {
+   NEURON_UNIDIRECTIONAL_SEQUENCE_RNN = 93,
+   NEURON_RESIZE_NEAREST_NEIGHBOR = 94,
+   NEURON_HARD_SWISH = 99,
++  // npu-stt 0002: codes from the public Neuron headers in
++  // github.com/onnxruntime/onnxruntime-ep-neuropilot (MIT,
++  // neuron_lib/neuron_types.h) and used by google-ai-edge/LiteRT
++  // (Apache-2.0, litert/vendors/mediatek/compiler/legalizations).
++  NEURON_BATCH_MATMUL = 102,  // Neuron >= 5.1.2
++  NEURON_GELU_V2 = 109,
+   NEURON_NUMBER_OF_OPERATIONS,
+   NEURON_OEM_OPERATION = 10000,
+ } NeuronOperationType;

@@ -1,0 +1,183 @@
+diff --git a/neuron/BUILD b/neuron/BUILD
+index 97862b7..bad92eb 100644
+--- a/neuron/BUILD
++++ b/neuron/BUILD
+@@ -102,6 +102,7 @@ cc_library(
+     name = "neuron_delegate",
+     srcs = [
+         "neuron_delegate.cc",
++        "npustt_filters.h",
+     ],
+     hdrs = [
+         "APUWareUtilsApi.h",
+diff --git a/neuron/neuron_delegate.cc b/neuron/neuron_delegate.cc
+index 576c4bc..da0244b 100644
+--- a/neuron/neuron_delegate.cc
++++ b/neuron/neuron_delegate.cc
+@@ -31,6 +31,7 @@
+ #include "neuron/neuron_delegate_validation.h"
+ #include "neuron/neuron_implementation.h"
+ #include "neuron/neuron_nnapi_delegate_kernel.h"
++#include "neuron/npustt_filters.h"
+ #include "tensorflow/lite/builtin_ops.h"
+ #include "tensorflow/lite/context_util.h"
+ #include "tensorflow/lite/delegates/utils/simple_delegate.h"
+@@ -45,11 +46,36 @@ namespace neuron {
+ class NeuronDelegate : public SimpleDelegateInterface {
+  public:
+   explicit NeuronDelegate(const NeuronDelegateOptions &options)
+-      : options_(options) {}
++      : options_(ExtractNpusttFilters(options, &filters_)) {
++    if (!filters_.excluded.empty() || filters_.max_softmax > 0) {
++      TFLITE_LOG_PROD(TFLITE_LOG_INFO,
++                      "npustt: excluded ops: [%s], max softmax elements: %lld, "
++                      "compile options passed on: \"%s\"",
++                      filters_.excluded_names.c_str(), filters_.max_softmax,
++                      options_.compile_options);
++    }
++  }
+ 
+   bool IsNodeSupportedByDelegate(const TfLiteRegistration *registration,
+                                  const TfLiteNode *node,
+                                  TfLiteContext *context) const override {
++    const char *excluded_reason = nullptr;
++    if (filters_.excluded.count(registration->builtin_code) != 0) {
++      excluded_reason = "excluded by --npustt-exclude";
++    } else if (filters_.max_softmax > 0 &&
++               registration->builtin_code == kTfLiteBuiltinSoftmax &&
++               ElementCount(context->tensors[node->inputs->data[0]].dims) >
++                   filters_.max_softmax) {
++      excluded_reason = "larger than --npustt-max-softmax";
++    }
++    if (excluded_reason != nullptr) {
++      TFLITE_LOG_PROD(
++          tflite::TFLITE_LOG_ERROR, "OP %s (v%d) is not supported (%s)",
++          tflite::EnumNameBuiltinOperator(
++              static_cast<BuiltinOperator>(registration->builtin_code)),
++          registration->version, excluded_reason);
++      return false;
++    }
+     std::vector<NeuronValidationFailure> failure;
+     bool supported = Validate(registration, node, context, &failure);
+     if (!supported) {
+@@ -170,6 +196,8 @@ class NeuronDelegate : public SimpleDelegateInterface {
+   }
+ 
+   const NeuronApi *neuron_ = NeuronApiImplementation();
++  // npu-stt 0003: declared before options_, which is initialised from it.
++  NpusttFilters filters_;
+   const NeuronDelegateOptions options_;
+   // If true, redirect the graph to NNAPI delegate
+   bool redirect_nnapi_ = false;
+diff --git a/neuron/npustt_filters.h b/neuron/npustt_filters.h
+new file mode 100644
+index 0000000..2e0aa91
+--- /dev/null
++++ b/neuron/npustt_filters.h
+@@ -0,0 +1,106 @@
++/*
++ * npu-stt patch 0003 (MIT, like the delegate it extends): op filters given as
++ * extra tokens in NeuronDelegateOptions.compile_options.
++ */
++#ifndef NEURON_NPUSTT_FILTERS_H_
++#define NEURON_NPUSTT_FILTERS_H_
++
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <set>
++#include <string>
++#include <vector>
++
++#include "neuron/neuron_delegate.h"
++#include "tensorflow/lite/c/common.h"
++#include "tensorflow/lite/minimal_logging.h"
++#include "tensorflow/lite/schema/schema_generated.h"
++
++namespace tflite {
++namespace neuron {
++
++// npu-stt 0003: delegate-side op filters, given as extra tokens in
++// compile_options and removed before the string reaches the Neuron compiler:
++//   --npustt-exclude=OP1,OP2,...   TFLite builtin names (e.g. SOFTMAX), these
++//                                  ops stay on the CPU
++//   --npustt-max-softmax=N         SOFTMAX nodes whose input has more than N
++//                                  elements stay on the CPU
++struct NpusttFilters {
++  std::set<int> excluded;
++  std::string excluded_names;
++  long long max_softmax = 0;  // 0 = no limit
++};
++
++inline long long ElementCount(const TfLiteIntArray *dims) {
++  long long n = 1;
++  for (int i = 0; dims != nullptr && i < dims->size; ++i) n *= dims->data[i];
++  return n;
++}
++
++inline int BuiltinCodeFromName(const std::string &name) {
++  for (int i = BuiltinOperator_MIN; i <= BuiltinOperator_MAX; ++i) {
++    if (name == EnumNameBuiltinOperator(static_cast<BuiltinOperator>(i))) {
++      return i;
++    }
++  }
++  return -1;
++}
++
++// Returns `in` with the npu-stt tokens removed from compile_options (the
++// string is left untouched when it holds no such token) and fills `filters`.
++inline NeuronDelegateOptions ExtractNpusttFilters(const NeuronDelegateOptions &in,
++                                                  NpusttFilters *filters) {
++  static const std::string kExclude = "--npustt-exclude=";
++  static const std::string kMaxSoftmax = "--npustt-max-softmax=";
++  // Split on whitespace / commas by hand (no <sstream>: it adds ~66 KB).
++  auto split = [](const std::string &s, const char *seps) {
++    std::vector<std::string> parts;
++    size_t pos = 0;
++    while ((pos = s.find_first_not_of(seps, pos)) != std::string::npos) {
++      const size_t end = s.find_first_of(seps, pos);
++      parts.push_back(s.substr(pos, end - pos));
++      pos = end;
++    }
++    return parts;
++  };
++  NeuronDelegateOptions out = in;
++  std::string rest;
++  bool found = false;
++  for (const std::string &token : split(in.compile_options, " \t\n")) {
++    if (token.compare(0, kExclude.size(), kExclude) == 0) {
++      found = true;
++      for (std::string name : split(token.substr(kExclude.size()), ",")) {
++        for (auto &c : name) c = std::toupper(static_cast<unsigned char>(c));
++        const int code = BuiltinCodeFromName(name);
++        if (code < 0) {
++          TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
++                          "npustt: unknown op name in --npustt-exclude: %s",
++                          name.c_str());
++          continue;
++        }
++        if (filters->excluded.insert(code).second) {
++          if (!filters->excluded_names.empty()) filters->excluded_names += ",";
++          filters->excluded_names += name;
++        }
++      }
++    } else if (token.compare(0, kMaxSoftmax.size(), kMaxSoftmax) == 0) {
++      found = true;
++      filters->max_softmax =
++          std::strtoll(token.c_str() + kMaxSoftmax.size(), nullptr, 10);
++    } else {
++      if (!rest.empty()) rest += " ";
++      rest += token;
++    }
++  }
++  if (found) {
++    std::snprintf(out.compile_options, sizeof(out.compile_options), "%s",
++                  rest.c_str());
++  }
++  return out;
++}
++
++}  // namespace neuron
++}  // namespace tflite
++
++#endif  // NEURON_NPUSTT_FILTERS_H_

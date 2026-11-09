@@ -1,0 +1,32 @@
+mediatek-npu-bridge
+Copyright (c) 2026 KatayR, MIT License (see LICENSE): the patches in patches/, the scripts, tests,
+examples and documentation of this repository.
+
+The patches modify MediaTek's TensorFlow Lite Neuron delegate,
+https://github.com/MediaTek-NeuroPilot/tflite-neuron-delegate (commit abb45cca4d22a7b02cdd87191d7c1fef44235c1c),
+Copyright (c) 2021 MediaTek Inc., MIT License (LICENSES/MIT-MediaTek.txt). The patched files keep
+MediaTek's notice; the two new files the patches add (neuron/npustt_filters.h, neuron/npustt_dla_cache.h)
+are under the same MIT terms.
+
+The prebuilt AAR (tensorflow-lite-neuron-mtk-bridge-*.aar, published on the Releases page, not in this
+repository) is built from that patched delegate and links, statically, into
+jni/arm64-v8a/libtensorflowlite_neuron_jni.so:
+
+- MediaTek's delegate sources (MIT, LICENSES/MIT-MediaTek.txt), including the files neuron/mtk/mtk_utils.cc,
+  neuron/mtk/mtk_utils.h and neuron/neuropilot_trace.h, whose own headers carry a MediaTek "Copyright
+  Statement" rather than the MIT text, and the prebuilt static library neuron/lib/libneuron_performance.a,
+  all as distributed in MediaTek's MIT-licensed repository;
+- parts of TensorFlow Lite 2.8.0 (c/common, core/api, delegates/nnapi, delegates/utils/simple_delegate,
+  kernels/kernel_util and their headers), Copyright The TensorFlow Authors, Apache License 2.0
+  (LICENSES/Apache-2.0-TensorFlow.txt); FlatBuffers header code used by them, Apache License 2.0;
+- FarmHash, Copyright (c) 2014 Google, Inc., MIT License (LICENSES/MIT-FarmHash.txt).
+
+The AAR's classes.jar holds only org.tensorflow.lite.NeuronDelegate and NeuronDelegate$Options (MediaTek,
+MIT, patched). The AAR itself ships MediaTek's LICENSE file only; this NOTICE and LICENSES/ go with it.
+
+The Neuron runtime (libneuronusdk_adapter.mtk.so, the NPU compiler and driver) is not part of this
+repository or of the AAR: it is MediaTek's, preinstalled on the phone, and loaded at run time.
+
+Public references used while writing patches 0002 and 0004 (operation codes, operand layouts, function
+signatures; no code copied): google-ai-edge/LiteRT (Apache-2.0), litert/vendors/mediatek;
+onnxruntime/onnxruntime-ep-neuropilot (MIT); pytorch/executorch (BSD), backends/mediatek.

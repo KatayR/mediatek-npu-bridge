@@ -1,0 +1,546 @@
+diff --git a/neuron/BUILD b/neuron/BUILD
+index bad92eb..677ab3b 100644
+--- a/neuron/BUILD
++++ b/neuron/BUILD
+@@ -62,6 +62,7 @@ cc_library(
+     hdrs = [
+         "APUWareUtilsApi.h",
+         "neuron_delegate_kernel.h",
++        "npustt_dla_cache.h",
+     ],
+     linkopts = android_linkopts(),
+     deps = [
+diff --git a/neuron/neuron_delegate.cc b/neuron/neuron_delegate.cc
+index da0244b..811de77 100644
+--- a/neuron/neuron_delegate.cc
++++ b/neuron/neuron_delegate.cc
+@@ -31,6 +31,7 @@
+ #include "neuron/neuron_delegate_validation.h"
+ #include "neuron/neuron_implementation.h"
+ #include "neuron/neuron_nnapi_delegate_kernel.h"
++#include "neuron/npustt_dla_cache.h"
+ #include "neuron/npustt_filters.h"
+ #include "tensorflow/lite/builtin_ops.h"
+ #include "tensorflow/lite/context_util.h"
+@@ -54,6 +55,27 @@ class NeuronDelegate : public SimpleDelegateInterface {
+                       filters_.excluded_names.c_str(), filters_.max_softmax,
+                       options_.compile_options);
+     }
++    // npu-stt 0004: one line per delegate instance when DLA mode is asked for.
++    if (neuron_->neuron_exists &&
++        NpusttDlaRequested(options_.cache_dir, options_.model_token)) {
++      const char *missing = NpusttDlaMissingSymbol(
++          neuron_->NeuronCompilation_getCompiledNetworkSize != nullptr,
++          neuron_->NeuronCompilation_storeCompiledNetwork != nullptr,
++          neuron_->NeuronModel_restoreFromCompiledNetwork != nullptr);
++      if (missing != nullptr) {
++        TFLITE_LOG_PROD(TFLITE_LOG_INFO,
++                        "npustt: dla cache unavailable (missing %s)", missing);
++      } else {
++        NeuronRuntimeVersion version = {};
++        neuron_->Neuron_getVersion(&version);
++        TFLITE_LOG_PROD(TFLITE_LOG_INFO,
++                        "npustt: dla cache dir=%s token=%s neuron=%s",
++                        options_.cache_dir, options_.model_token,
++                        NpusttVersionString(version.major, version.minor,
++                                            version.patch)
++                            .c_str());
++      }
++    }
+   }
+ 
+   bool IsNodeSupportedByDelegate(const TfLiteRegistration *registration,
+diff --git a/neuron/neuron_delegate_kernel.cc b/neuron/neuron_delegate_kernel.cc
+index d2107f6..28d4cc6 100644
+--- a/neuron/neuron_delegate_kernel.cc
++++ b/neuron/neuron_delegate_kernel.cc
+@@ -41,6 +41,8 @@
+ #include <inttypes.h>
+ #include <string.h>
+ 
++#include <cstdlib>
++
+ #include <iostream>
+ 
+ #include "neuron/mtk/mtk_utils.h"
+@@ -1040,6 +1042,40 @@ TfLiteStatus NeuronDelegateKernel::Prepare(TfLiteContext* context,
+     return kTfLiteOk;
+   }
+ 
++  // npu-stt 0004: compiled-network ("DLA") cache when cache_dir and
++  // model_token are both set and the adapter has the three calls. The key is
++  // taken here, before strtok below cuts accelerator_name at the first comma.
++  std::string dla_dir;
++  std::string dla_key;
++  if (NpusttDlaRequested(options_.cache_dir, options_.model_token) &&
++      NpusttDlaMissingSymbol(
++          neuronapi_->NeuronCompilation_getCompiledNetworkSize != nullptr,
++          neuronapi_->NeuronCompilation_storeCompiledNetwork != nullptr,
++          neuronapi_->NeuronModel_restoreFromCompiledNetwork != nullptr) ==
++          nullptr) {
++    NeuronRuntimeVersion version = {};
++    neuronapi_->Neuron_getVersion(&version);
++    dla_dir = NpusttDlaDir(options_.cache_dir, options_.model_token);
++    dla_key = NpusttDlaKey(
++        nn_compilation_cache_token_, options_.accelerator_name,
++        NNCompilationArgs::GetArgs(options_.execution_preference).c_str(),
++        options_.compile_options, options_.allow_fp16,
++        NpusttVersionString(version.major, version.minor, version.patch));
++    if (RestoreDla(dla_dir, dla_key)) {
++      // Restored: no createForDevices, setOptimizationString, setCaching or
++      // NeuronCompilation_finish, so the weights are never read.
++#ifdef NEURON_REUSABLE_EXECUTION
++      NeuronExecution* execution = nullptr;
++      RETURN_TFLITE_ERROR_IF_NEURON_ERROR(
++          context,
++          neuronapi_->NeuronExecution_create(nn_compilation_.get(), &execution),
++          "creating Neuron execution");
++      nn_execution_.reset(execution);
++#endif
++      return kTfLiteOk;
++    }
++  }
++
+   NeuronCompilation* compilation = nullptr;
+   uint32_t num_devices = 0;
+ 
+@@ -1121,7 +1157,8 @@ TfLiteStatus NeuronDelegateKernel::Prepare(TfLiteContext* context,
+             compilation, options_.optimization_hint),
+         "set optimization hint");
+   }
+-  if (options_.cache_dir != nullptr && !nn_compilation_cache_token_.empty()) {
++  if (options_.cache_dir != nullptr && !nn_compilation_cache_token_.empty() &&
++      dla_key.empty()) {
+     RETURN_TFLITE_ERROR_IF_NEURON_ERROR(
+         context,
+         neuronapi_->NeuronCompilation_setCaching(
+@@ -1162,6 +1199,9 @@ TfLiteStatus NeuronDelegateKernel::Prepare(TfLiteContext* context,
+   RETURN_TFLITE_ERROR_IF_NEURON_ERROR(context, finish_result,
+                                       "completing Neuron compilation");
+   nn_compilation_.reset(compilation);
++  if (!dla_key.empty()) {
++    StoreDla(dla_dir, dla_key);
++  }
+ 
+ #ifdef NEURON_REUSABLE_EXECUTION
+   NeuronExecution* execution = nullptr;
+@@ -1175,6 +1215,86 @@ TfLiteStatus NeuronDelegateKernel::Prepare(TfLiteContext* context,
+   return kTfLiteOk;
+ }
+ 
++bool NeuronDelegateKernel::RestoreDla(const std::string& dir,
++                                      const std::string& key) {
++  const std::string path = NpusttDlaPath(dir, key);
++  const long long t0 = NpusttNowMs();
++  NpusttMappedFile file;
++  int code = file.Map(path);
++  if (code == -ENOENT) {
++    TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
++                    "npustt: dla restore key=%s result=miss", key.c_str());
++    return false;
++  }
++  NeuronModel* model = nullptr;
++  NeuronCompilation* compilation = nullptr;
++  if (code == 0) {
++    code = neuronapi_->NeuronModel_restoreFromCompiledNetwork(
++        &model, &compilation, file.data(), file.size());
++    if (code == NEURON_NO_ERROR && (model == nullptr || compilation == nullptr)) {
++      if (compilation != nullptr) neuronapi_->NeuronCompilation_free(compilation);
++      if (model != nullptr) neuronapi_->NeuronModel_free(model);
++      code = -EFAULT;
++    }
++  }
++  if (code != 0) {
++    // Negative codes are -errno from open/fstat/mmap, positive ones Neuron's.
++    // On a Neuron error nothing is freed: the adapter keeps what it created.
++    TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
++                    "npustt: dla restore key=%s result=fail code=%d",
++                    key.c_str(), code);
++    file.Reset();
++    unlink(path.c_str());
++    return false;
++  }
++  // Replaces (frees) the model built in Init; its weights were never compiled.
++  nn_model_.reset(model);
++  nn_compilation_.reset(compilation);
++  file.ReleasePages();
++  dla_file_ = std::move(file);
++  TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
++                  "npustt: dla restore key=%s result=hit bytes=%zu ms=%lld",
++                  key.c_str(), dla_file_.size(), NpusttNowMs() - t0);
++  return true;
++}
++
++void NeuronDelegateKernel::StoreDla(const std::string& dir,
++                                    const std::string& key) {
++  const long long t0 = NpusttNowMs();
++  size_t size = 0;
++  int code = neuronapi_->NeuronCompilation_getCompiledNetworkSize(
++      nn_compilation_.get(), &size);
++  if (code != NEURON_NO_ERROR || size == 0) {
++    TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
++                    "npustt: dla store key=%s result=fail code=%d stage=size",
++                    key.c_str(), code != NEURON_NO_ERROR ? code : -EINVAL);
++    return;
++  }
++  // Transient: one buffer at a time, freed before the next partition compiles.
++  void* buffer = std::malloc(size);
++  const char* stage = "store";
++  if (buffer == nullptr) {
++    code = -ENOMEM;
++  } else {
++    code = neuronapi_->NeuronCompilation_storeCompiledNetwork(
++        nn_compilation_.get(), buffer, size);
++    if (code == NEURON_NO_ERROR) {
++      stage = "write";
++      code = NpusttWriteFileAtomic(dir, key, buffer, size);
++    }
++    std::free(buffer);
++  }
++  if (code != 0) {
++    TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
++                    "npustt: dla store key=%s result=fail code=%d stage=%s",
++                    key.c_str(), code, stage);
++    return;
++  }
++  TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
++                  "npustt: dla store key=%s result=ok bytes=%zu ms=%lld",
++                  key.c_str(), size, NpusttNowMs() - t0);
++}
++
+ TfLiteStatus NeuronDelegateKernel::Eval(TfLiteContext* context,
+                                         TfLiteNode* node) {
+   MTK_ATRACE_CALL();
+diff --git a/neuron/neuron_delegate_kernel.h b/neuron/neuron_delegate_kernel.h
+index 9ebb145..1321a57 100644
+--- a/neuron/neuron_delegate_kernel.h
++++ b/neuron/neuron_delegate_kernel.h
+@@ -38,6 +38,7 @@
+ #include "neuron/neuron_delegate_validation.h"
+ #include "neuron/neuron_implementation.h"
+ #include "neuron/neuron_performance.h"
++#include "neuron/npustt_dla_cache.h"
+ #include "tensorflow/lite/delegates/utils/simple_delegate.h"
+ 
+ #define NEURON_REUSABLE_EXECUTION
+@@ -176,6 +177,10 @@ class NeuronDelegateKernel : public SimpleDelegateKernelInterface {
+   NeuronDelegateOptions options_;
+   // True if initialization has been completed successfully
+   bool initialised_;
++  // npu-stt 0004: mapping of the restored <key>.dla, kept for the kernel's
++  // lifetime (declared before nn_model_, so it is unmapped after the model and
++  // the compilation are freed).
++  NpusttMappedFile dla_file_;
+   std::unique_ptr<NeuronModel, NNFreeModel> nn_model_;
+   std::unique_ptr<NeuronCompilation, NNFreeCompilation> nn_compilation_;
+ #ifdef NEURON_REUSABLE_EXECUTION
+@@ -215,6 +220,13 @@ class NeuronDelegateKernel : public SimpleDelegateKernelInterface {
+   TfLiteStatus BuildGraph(TfLiteContext* context,
+                           const TfLiteIntArray* input_tensors,
+                           const TfLiteIntArray* output_tensors);
++
++  // npu-stt 0004: true when <dir>/<key>.dla was restored into nn_model_ and
++  // nn_compilation_; false (after logging) means: compile as usual.
++  bool RestoreDla(const std::string& dir, const std::string& key);
++  // npu-stt 0004: writes the finished nn_compilation_ to <dir>/<key>.dla;
++  // failures are only logged.
++  void StoreDla(const std::string& dir, const std::string& key);
+ };
+ 
+ }  // namespace neuron
+diff --git a/neuron/neuron_implementation.cc b/neuron/neuron_implementation.cc
+index 387f779..c60c261 100644
+--- a/neuron/neuron_implementation.cc
++++ b/neuron/neuron_implementation.cc
+@@ -184,6 +184,10 @@ const NeuronApi LoadNeuronApi() {
+   LOAD_FUNCTION(libneuron_adapter, NeuronCompilation_setPriority, neuron_api);
+   LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
+                          NeuronCompilation_getCompiledNetworkSize, neuron_api);
++  LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
++                         NeuronCompilation_storeCompiledNetwork, neuron_api);
++  LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
++                         NeuronModel_restoreFromCompiledNetwork, neuron_api);
+   LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
+                          NeuronCompilation_setOptimizationHint, neuron_api);
+   LOAD_FUNCTION(libneuron_adapter, NeuronCompilation_free, neuron_api);
+diff --git a/neuron/neuron_implementation.h b/neuron/neuron_implementation.h
+index ba40ffe..3deffea 100644
+--- a/neuron/neuron_implementation.h
++++ b/neuron/neuron_implementation.h
+@@ -138,6 +138,18 @@ struct NeuronApi {
+   int (*NeuronCompilation_getCompiledNetworkSize)(
+       NeuronCompilation* compilation, size_t* size);
+ 
++  // npu-stt 0004: store the compiled network into a caller-owned buffer.
++  int (*NeuronCompilation_storeCompiledNetwork)(NeuronCompilation* compilation,
++                                                void* buffer,
++                                                const size_t size);
++
++  // npu-stt 0004: restore a model and a finished compilation from a stored
++  // compiled network.
++  int (*NeuronModel_restoreFromCompiledNetwork)(NeuronModel** model,
++                                                NeuronCompilation** compilation,
++                                                const void* buffer,
++                                                const size_t size);
++
+   // Sets compiler optimization hint.
+   int (*NeuronCompilation_setOptimizationHint)(NeuronCompilation* compilation,
+                                                uint32_t optimizationCode);
+diff --git a/neuron/neuron_types.h b/neuron/neuron_types.h
+index d23b2bc..5adae3f 100644
+--- a/neuron/neuron_types.h
++++ b/neuron/neuron_types.h
+@@ -379,6 +379,17 @@ typedef int (*NeuronCompilation_setPriority_fn)(NeuronCompilation* compilation,
+ typedef int (*NeuronCompilation_getCompiledNetworkSize_fn)(
+     NeuronCompilation* compilation, size_t* size);
+ 
++// npu-stt 0004: store the compiled network of a finished compilation into a
++// buffer of getCompiledNetworkSize bytes.
++typedef int (*NeuronCompilation_storeCompiledNetwork_fn)(
++    NeuronCompilation* compilation, void* buffer, const size_t size);
++
++// npu-stt 0004: create a model and a finished compilation from a buffer
++// written by NeuronCompilation_storeCompiledNetwork.
++typedef int (*NeuronModel_restoreFromCompiledNetwork_fn)(
++    NeuronModel** model, NeuronCompilation** compilation, const void* buffer,
++    const size_t size);
++
+ // Sets compiler optimization hint.
+ typedef int (*NeuronCompilation_setOptimizationHint_fn)(
+     NeuronCompilation* compilation, uint32_t optimizationCode);
+diff --git a/neuron/npustt_dla_cache.h b/neuron/npustt_dla_cache.h
+new file mode 100644
+index 0000000..e14a2ca
+--- /dev/null
++++ b/neuron/npustt_dla_cache.h
+@@ -0,0 +1,230 @@
++/*
++ * npu-stt patch 0004 (MIT, like the delegate it extends): compiled-network
++ * ("DLA") cache. Pure helpers, no Neuron calls, so they can be unit-tested on
++ * the host: cache key, paths, mkdir -p, tmp-then-rename write, read-only mmap.
++ */
++#ifndef NEURON_NPUSTT_DLA_CACHE_H_
++#define NEURON_NPUSTT_DLA_CACHE_H_
++
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace tflite {
++namespace neuron {
++
++// DLA mode is asked for when both cache_dir and model_token are non-empty.
++inline bool NpusttDlaRequested(const char* cache_dir, const char* model_token) {
++  return cache_dir != nullptr && cache_dir[0] != '\0' &&
++         model_token != nullptr && model_token[0] != '\0';
++}
++
++// Name of the first missing adapter symbol, or nullptr when all three exist.
++inline const char* NpusttDlaMissingSymbol(bool has_get_size, bool has_store,
++                                          bool has_restore) {
++  if (!has_get_size) return "NeuronCompilation_getCompiledNetworkSize";
++  if (!has_store) return "NeuronCompilation_storeCompiledNetwork";
++  if (!has_restore) return "NeuronModel_restoreFromCompiledNetwork";
++  return nullptr;
++}
++
++inline std::string NpusttVersionString(int major, int minor, int patch) {
++  char buf[32];
++  std::snprintf(buf, sizeof(buf), "%d.%d.%d", major, minor, patch);
++  return buf;
++}
++
++// FNV-1a 64-bit. Every field is followed by its length (8 bytes, LE) so that
++// moving bytes between neighbouring fields changes the key.
++class NpusttFnv1a64 {
++ public:
++  void Bytes(const void* data, size_t size) {
++    const uint8_t* p = static_cast<const uint8_t*>(data);
++    for (size_t i = 0; i < size; ++i) {
++      hash_ ^= p[i];
++      hash_ *= 0x100000001b3ULL;
++    }
++  }
++  void Field(const void* data, size_t size) {
++    Bytes(data, size);
++    uint8_t len[8];
++    for (int i = 0; i < 8; ++i) len[i] = static_cast<uint8_t>(size >> (8 * i));
++    Bytes(len, sizeof(len));
++  }
++  void Field(const char* s) { Field(s, s == nullptr ? 0 : std::strlen(s)); }
++  uint64_t value() const { return hash_; }
++
++ private:
++  uint64_t hash_ = 0xcbf29ce484222325ULL;
++};
++
++// 16 lowercase hex chars over the inputs listed in notes/spec-dla-cache.md.
++inline std::string NpusttDlaKey(const std::vector<uint8_t>& graph_token,
++                                const char* accelerator_name,
++                                const char* builtin_compile_args,
++                                const char* compile_options, bool allow_fp16,
++                                const std::string& neuron_version) {
++  NpusttFnv1a64 h;
++  h.Field(graph_token.data(), graph_token.size());
++  h.Field(accelerator_name);
++  h.Field(builtin_compile_args);
++  h.Field(compile_options);
++  const uint8_t fp16 = allow_fp16 ? 1 : 0;
++  h.Field(&fp16, 1);
++  h.Field(neuron_version.c_str());
++  h.Field("0004");
++  char buf[17];
++  std::snprintf(buf, sizeof(buf), "%016llx",
++                static_cast<unsigned long long>(h.value()));
++  return buf;
++}
++
++// <cache_dir>/npustt-dla/<model_token>; characters other than [A-Za-z0-9._-]
++// in the token become '_' (an MD5 hex token is kept as it is), so a token can
++// never leave the cache directory.
++inline std::string NpusttDlaDir(const char* cache_dir, const char* model_token) {
++  std::string dir = cache_dir;
++  while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
++  std::string token = model_token;
++  for (auto& c : token) {
++    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
++    if (!ok) c = '_';
++  }
++  if (token == "." || token == "..") token = "_";
++  return dir + "/npustt-dla/" + token;
++}
++
++inline std::string NpusttDlaPath(const std::string& dir, const std::string& key,
++                                 const char* suffix = ".dla") {
++  return dir + "/" + key + suffix;
++}
++
++// mkdir -p; 0 or -errno.
++inline int NpusttMakeDirs(const std::string& path) {
++  for (size_t pos = 1; pos <= path.size(); ++pos) {
++    if (pos != path.size() && path[pos] != '/') continue;
++    const std::string part = path.substr(0, pos);
++    if (mkdir(part.c_str(), 0755) != 0 && errno != EEXIST) return -errno;
++  }
++  struct stat st;
++  if (stat(path.c_str(), &st) != 0) return -errno;
++  return S_ISDIR(st.st_mode) ? 0 : -ENOTDIR;
++}
++
++// Writes buf to <dir>/<key>.tmp (fsync) and renames it to <dir>/<key>.dla,
++// creating dir first. 0 or -errno; the .tmp file is removed on failure.
++inline int NpusttWriteFileAtomic(const std::string& dir, const std::string& key,
++                                 const void* buf, size_t size) {
++  int rc = NpusttMakeDirs(dir);
++  if (rc != 0) return rc;
++  const std::string tmp = NpusttDlaPath(dir, key, ".tmp");
++  const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++  if (fd < 0) return -errno;
++  const uint8_t* p = static_cast<const uint8_t*>(buf);
++  size_t left = size;
++  while (left > 0 && rc == 0) {
++    const ssize_t n = write(fd, p, left);
++    if (n < 0 && errno == EINTR) continue;
++    if (n <= 0) {
++      rc = n < 0 ? -errno : -EIO;
++      break;
++    }
++    p += n;
++    left -= static_cast<size_t>(n);
++  }
++  if (rc == 0 && fsync(fd) != 0) rc = -errno;
++  if (close(fd) != 0 && rc == 0) rc = -errno;
++  if (rc == 0 && rename(tmp.c_str(), NpusttDlaPath(dir, key).c_str()) != 0) {
++    rc = -errno;
++  }
++  if (rc != 0) unlink(tmp.c_str());
++  return rc;
++}
++
++// Read-only private mapping of a whole file, unmapped by the destructor.
++class NpusttMappedFile {
++ public:
++  NpusttMappedFile() = default;
++  NpusttMappedFile(const NpusttMappedFile&) = delete;
++  NpusttMappedFile& operator=(const NpusttMappedFile&) = delete;
++  NpusttMappedFile(NpusttMappedFile&& o) noexcept { *this = std::move(o); }
++  NpusttMappedFile& operator=(NpusttMappedFile&& o) noexcept {
++    if (this != &o) {
++      Reset();
++      data_ = o.data_;
++      size_ = o.size_;
++      o.data_ = nullptr;
++      o.size_ = 0;
++    }
++    return *this;
++  }
++  ~NpusttMappedFile() { Reset(); }
++
++  // 0, -ENOENT when the file does not exist, or another -errno (an empty
++  // file gives -EINVAL). The descriptor is closed again right away.
++  int Map(const std::string& path) {
++    Reset();
++    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0) return -errno;
++    struct stat st;
++    int rc = 0;
++    if (fstat(fd, &st) != 0) {
++      rc = -errno;
++    } else if (st.st_size <= 0) {
++      rc = -EINVAL;
++    } else {
++      void* p = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ,
++                     MAP_PRIVATE, fd, 0);
++      if (p == MAP_FAILED) {
++        rc = -errno;
++      } else {
++        data_ = p;
++        size_ = static_cast<size_t>(st.st_size);
++      }
++    }
++    close(fd);
++    return rc;
++  }
++
++  // Drops the resident pages (they are re-read from the file if touched
++  // again), so a restored network does not keep the file in this process's
++  // RSS/PSS. The mapping itself stays valid.
++  void ReleasePages() {
++    if (data_ != nullptr) madvise(data_, size_, MADV_DONTNEED);
++  }
++
++  void Reset() {
++    if (data_ != nullptr) munmap(data_, size_);
++    data_ = nullptr;
++    size_ = 0;
++  }
++
++  const void* data() const { return data_; }
++  size_t size() const { return size_; }
++
++ private:
++  void* data_ = nullptr;
++  size_t size_ = 0;
++};
++
++inline long long NpusttNowMs() {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<long long>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
++}
++
++}  // namespace neuron
++}  // namespace tflite
++
++#endif  // NEURON_NPUSTT_DLA_CACHE_H_

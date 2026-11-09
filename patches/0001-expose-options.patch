@@ -1,0 +1,281 @@
+diff --git a/neuron/java/src/main/java/org/tensorflow/lite/NeuronDelegate.java b/neuron/java/src/main/java/org/tensorflow/lite/NeuronDelegate.java
+index 9265090..eecc86e 100644
+--- a/neuron/java/src/main/java/org/tensorflow/lite/NeuronDelegate.java
++++ b/neuron/java/src/main/java/org/tensorflow/lite/NeuronDelegate.java
+@@ -77,8 +77,83 @@ public class NeuronDelegate implements Delegate, Closeable {
+       return this;
+     }
+ 
++    /** Execution priorities (NeuronDelegateOptions.execution_priority). */
++    public static final int EXECUTION_PRIORITY_LOW = 90;
++    public static final int EXECUTION_PRIORITY_MEDIUM = 100;
++    public static final int EXECUTION_PRIORITY_HIGH = 110;
++
++    /** Optimization hints, a bit mask (NeuronDelegateOptions.optimization_hint). */
++    public static final int OPTIMIZATION_NONE = 0;
++    public static final int OPTIMIZATION_LOW_LATENCY = 1;
++    public static final int OPTIMIZATION_DEEP_FUSION = 2;
++    public static final int OPTIMIZATION_BATCH_PROCESSOR = 4;
++
++    /** Sets the execution priority, one of EXECUTION_PRIORITY_*. Default HIGH. */
++    public Options setExecutionPriority(int priority) {
++      this.executionPriority = priority;
++      return this;
++    }
++
++    /** Sets the optimization hint, OR of OPTIMIZATION_*. Default LOW_LATENCY. */
++    public Options setOptimizationHint(int hint) {
++      this.optimizationHint = hint;
++      return this;
++    }
++
++    /**
++     * Sets the performance boost duration in ms. 0 (default) lets the delegate choose: 2000 ms for
++     * FAST_SINGLE_ANSWER, 10 ms otherwise.
++     */
++    public Options setBoostDuration(int durationMs) {
++      if (durationMs < 0) {
++        throw new IllegalArgumentException("boostDuration must be >= 0");
++      }
++      this.boostDuration = durationMs;
++      return this;
++    }
++
++    /**
++     * Sets the Neuron device(s) to compile for, e.g. "mtk-mdla" or "mtk-mdla,mtk-dsp" (exact
++     * names, at most 49 bytes). Null or empty lets Neuron choose.
++     */
++    public Options setAcceleratorName(String acceleratorName) {
++      this.acceleratorName = acceleratorName;
++      return this;
++    }
++
++    /**
++     * Sets extra compiler options, e.g. "--relax-fp32" (at most 199 bytes). Applied after the
++     * built-in "--opt-accuracy --opt 3".
++     */
++    public Options setCompileOptions(String compileOptions) {
++      this.compileOptions = compileOptions;
++      return this;
++    }
++
++    /** Sets the directory for the compiled-network cache. Null or empty disables caching. */
++    public Options setCacheDir(String cacheDir) {
++      this.cacheDir = cacheDir;
++      return this;
++    }
++
++    /**
++     * Sets the model token. Note: the delegate at commit abb45cca never reads it; the cache key is
++     * derived from the delegated partition.
++     */
++    public Options setModelToken(String modelToken) {
++      this.modelToken = modelToken;
++      return this;
++    }
++
+     private int executionPreference = EXECUTION_PREFERENCE_FAST_SINGLE_ANSWER;
+     private Boolean allowFp16 = null;
++    private int executionPriority = EXECUTION_PRIORITY_HIGH;
++    private int optimizationHint = OPTIMIZATION_LOW_LATENCY;
++    private int boostDuration = 0;
++    private String acceleratorName = null;
++    private String compileOptions = null;
++    private String cacheDir = null;
++    private String modelToken = null;
+   }
+ 
+   public NeuronDelegate(Options options) {
+@@ -86,7 +161,14 @@ public class NeuronDelegate implements Delegate, Closeable {
+     delegateHandle =
+         createDelegate(
+             options.executionPreference,
+-            options.allowFp16 != null ? options.allowFp16 : false);
++            options.allowFp16 != null ? options.allowFp16 : false,
++            options.executionPriority,
++            options.optimizationHint,
++            options.boostDuration,
++            options.acceleratorName,
++            options.compileOptions,
++            options.cacheDir,
++            options.modelToken);
+   }
+ 
+   public NeuronDelegate() {
+@@ -117,7 +199,14 @@ public class NeuronDelegate implements Delegate, Closeable {
+ 
+   private static native long createDelegate(
+     int preference,
+-    boolean allowFp16);
++    boolean allowFp16,
++    int executionPriority,
++    int optimizationHint,
++    int boostDuration,
++    String acceleratorName,
++    String compileOptions,
++    String cacheDir,
++    String modelToken);
+ 
+   private static native void deleteDelegate(long delegateHandle);
+ 
+diff --git a/neuron/java/src/main/native/neuron_delegate_jni.cc b/neuron/java/src/main/native/neuron_delegate_jni.cc
+index 4dbe6c4..caa058d 100644
+--- a/neuron/java/src/main/native/neuron_delegate_jni.cc
++++ b/neuron/java/src/main/native/neuron_delegate_jni.cc
+@@ -27,27 +27,152 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <utility>
++
+ #include "neuron/neuron_delegate.h"
+ 
+ #define TAG "NeuronDelegateJni"
+ 
++namespace {
++
++// NeuronDelegateOptions keeps cache_dir and model_token as raw pointers, and
++// the delegate copies only the pointers. The strings are duplicated here and
++// freed when the delegate is deleted.
++std::mutex g_owned_mutex;
++std::map<TfLiteDelegate*, std::pair<char*, char*>> g_owned_strings;
++
++void ThrowIllegalArgument(JNIEnv* env, const char* message) {
++  jclass cls = env->FindClass("java/lang/IllegalArgumentException");
++  if (cls != nullptr) {
++    env->ThrowNew(cls, message);
++  }
++}
++
++// Copies a Java string into a fixed-size, NUL-terminated char array. A null
++// string leaves `dst` unchanged. Returns false with a pending Java exception
++// if the string cannot be read or does not fit.
++bool CopyJString(JNIEnv* env, jstring s, char* dst, size_t cap,
++                 const char* what) {
++  if (s == nullptr) {
++    return true;
++  }
++  const char* chars = env->GetStringUTFChars(s, nullptr);
++  if (chars == nullptr) {
++    return false;  // OutOfMemoryError is pending.
++  }
++  const int n = snprintf(dst, cap, "%s", chars);
++  env->ReleaseStringUTFChars(s, chars);
++  if (n < 0 || static_cast<size_t>(n) >= cap) {
++    char message[96];
++    snprintf(message, sizeof(message), "%s is longer than %zu bytes", what,
++             cap - 1);
++    ThrowIllegalArgument(env, message);
++    return false;
++  }
++  return true;
++}
++
++// Returns a strdup'ed copy to be released with free(), or nullptr for a null
++// or empty string. Sets *ok to false (with a pending Java exception) on error.
++char* DupJString(JNIEnv* env, jstring s, bool* ok) {
++  *ok = true;
++  if (s == nullptr) {
++    return nullptr;
++  }
++  const char* chars = env->GetStringUTFChars(s, nullptr);
++  if (chars == nullptr) {
++    *ok = false;  // OutOfMemoryError is pending.
++    return nullptr;
++  }
++  char* copy = chars[0] != '\0' ? strdup(chars) : nullptr;
++  const bool failed = chars[0] != '\0' && copy == nullptr;
++  env->ReleaseStringUTFChars(s, chars);
++  if (failed) {
++    jclass cls = env->FindClass("java/lang/OutOfMemoryError");
++    if (cls != nullptr) {
++      env->ThrowNew(cls, "strdup failed");
++    }
++    *ok = false;
++  }
++  return copy;
++}
++
++}  // namespace
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+ JNIEXPORT jlong JNICALL Java_org_tensorflow_lite_NeuronDelegate_createDelegate(
+-    JNIEnv* env, jclass clazz, jint preference, jboolean allow_fp16) {
++    JNIEnv* env, jclass clazz, jint preference, jboolean allow_fp16,
++    jint execution_priority, jint optimization_hint, jint boost_duration,
++    jstring accelerator_name, jstring compile_options, jstring cache_dir,
++    jstring model_token) {
+ 
+   auto options = TfLiteNeuronDelegateOptionsDefault();
+   options.execution_preference = (ExecutionPreference)preference;
+ 
+-  options.allow_fp16 = allow_fp16;
+-  return reinterpret_cast<jlong>(TfLiteNeuronDelegateCreate(&options));
++  options.allow_fp16 = allow_fp16 == JNI_TRUE;
++  options.execution_priority = (ExecutionPriority)execution_priority;
++  options.optimization_hint = optimization_hint;
++  options.boost_duration =
++      boost_duration > 0 ? static_cast<uint32_t>(boost_duration) : 0;
++
++  if (!CopyJString(env, accelerator_name, options.accelerator_name,
++                   sizeof(options.accelerator_name), "acceleratorName") ||
++      !CopyJString(env, compile_options, options.compile_options,
++                   sizeof(options.compile_options), "compileOptions")) {
++    return 0;
++  }
++
++  bool ok = true;
++  char* owned_cache_dir = DupJString(env, cache_dir, &ok);
++  if (!ok) {
++    return 0;
++  }
++  char* owned_model_token = DupJString(env, model_token, &ok);
++  if (!ok) {
++    free(owned_cache_dir);
++    return 0;
++  }
++  options.cache_dir = owned_cache_dir;
++  options.model_token = owned_model_token;
++
++  TfLiteDelegate* delegate = TfLiteNeuronDelegateCreate(&options);
++  if (delegate == nullptr) {
++    free(owned_cache_dir);
++    free(owned_model_token);
++    return 0;
++  }
++  if (owned_cache_dir != nullptr || owned_model_token != nullptr) {
++    std::lock_guard<std::mutex> lock(g_owned_mutex);
++    g_owned_strings[delegate] = std::make_pair(owned_cache_dir,
++                                               owned_model_token);
++  }
++  return reinterpret_cast<jlong>(delegate);
+ }
+ 
+ JNIEXPORT void JNICALL Java_org_tensorflow_lite_NeuronDelegate_deleteDelegate(
+     JNIEnv* env, jclass clazz, jlong delegate) {
+-  TfLiteNeuronDelegateDelete(reinterpret_cast<TfLiteDelegate*>(delegate));
++  TfLiteDelegate* d = reinterpret_cast<TfLiteDelegate*>(delegate);
++  // Take the entry out before deleting, so a new delegate allocated at the
++  // same address cannot be confused with this one.
++  std::pair<char*, char*> owned(nullptr, nullptr);
++  {
++    std::lock_guard<std::mutex> lock(g_owned_mutex);
++    auto it = g_owned_strings.find(d);
++    if (it != g_owned_strings.end()) {
++      owned = it->second;
++      g_owned_strings.erase(it);
++    }
++  }
++  TfLiteNeuronDelegateDelete(d);
++  free(owned.first);
++  free(owned.second);
+ }
+ 
+ #ifdef __cplusplus

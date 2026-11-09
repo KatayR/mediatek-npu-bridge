@@ -1,0 +1,16 @@
+# Build outputs (the AAR is published on the Releases page, not in git)
+*.aar
+*.so
+*.o
+*.class
+*.jar
+benchmark_model_plus_neuron_delegate
+out/
+bazel-*
+build/out/
+
+# Gradle / IDE
+.gradle/
+.idea/
+*.iml
+local.properties
