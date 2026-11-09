@@ -166,13 +166,18 @@ Summary of probe runs (full table and method: [`probes/README.md`](probes/README
 - Weights must be float32 constants in the file (the compiler converts them); fp16-weight files with
   `DEQUANTIZE` are refused.
 - Refused: `BATCH_MATMUL`, the `GELU` op, `nn.LayerNorm` as litert-torch lowers it, big `SOFTMAX` inputs
-  (e.g. [16,256,256], while [4,512,512] and [16,128,128] pass), reshapes with a dimension > 65535, very wide
-  or strided 1-D convolutions.
+  (e.g. [16,256,256], while [4,512,512] and [16,128,128] pass), reshapes with a dimension > 65535, wide 1-D
+  convolutions (filter width 128) and a filter-width-10, stride-5 depthwise conv.
+- Plain 1-D convolutions with kernel 2 or 3 and stride 2 (`nn.Conv1d` as exported: `CONV_2D` with
+  `TRANSPOSE`s) are accepted. Faster still: a kernel-3 stride-2 conv as two `FULLY_CONNECTED`s on the frames
+  reshaped into pairs plus an `ADD` (2× faster, compiles in 0.2 s instead of 90 s), kernel 2 as reshape + one FC.
 - Accepted replacements: LayerNorm written out (mean, subtract, mean of squares, rsqrt), GELU as
   `x·sigmoid(1.5957691·(x + 0.044715·x³))`, matmuls as `FULLY_CONNECTED` / 1×1 `CONV_2D` (with a runtime weight
   tensor the sizes must be 16-aligned, e.g. 512 instead of 499), softmax per attention head.
-- A LayerNorm whose means were written as 1×1 convolutions compiled and ran but gave wrong numbers at one
-  shape (cosine 0.41). Always compare NPU outputs with the CPU.
+- Silent miscompiles (compiled, ran, wrong numbers): a LayerNorm whose means were 1×1 convolutions (cosine
+  0.41 at one shape), and a `CONCATENATION` along channels feeding one FC (im2col of a conv: cosine 0.95 alone,
+  0.66 in a stack; the same maths as a sum of FCs is right). Always compare NPU outputs with the CPU, and probe
+  composed graphs whole: parts that were right alone drifted or were refused together.
 - One refused op fails the whole compile (`NEURON_UNMAPPABLE`, `Compile error: NoExecPlan`); the compiler logs
   the real reason per op (`<OP>: MDLA: <reason>`). Fix the export, or keep that op type on the CPU with
   `--npustt-exclude=<OP>` (patch 0003), at the price of more partitions.
@@ -214,7 +219,10 @@ and APU buffers of many small partitions, and ops the NPU refuses. What worked:
    Pick the section size by the compile peak: the largest section whose whole compile fits in RAM with margin
    (6 of 24 layers, 2.4 GB peak, on the 8 GB phone).
 2. **Make every NPU section one whole partition**: only accepted forms inside (see above), no CPU islands.
-   Parts the NPU cannot take (e.g. a front end with very long inputs) go into their own CPU-only `.tflite`.
+   Parts the NPU cannot take go into their own CPU-only `.tflite`. A frame-local front end on a long input
+   (e.g. a conv feature encoder on 10 s of audio) can be cut into tiles so that every dimension stays ≤ 65535;
+   then the tile runs as a short chain, a CPU file for the layer the NPU handles badly and an NPU file for the
+   rest (a 6-block conv encoder: 263 ms on the CPU → 65 ms on the NPU per tile; details in the probe notes).
 3. **Run the sections in order** in one process, one `Interpreter` + `NeuronDelegate` per section, the output
    buffer of one feeding the next.
 4. **Check the cut on the PC**: the chained sections must reproduce the unsplit model bit for bit on the same

@@ -43,12 +43,42 @@ the export.
 | `RESHAPE` with a dimension > 65535 | a [1,163920] input | refused: "Cannot support the Reshape of which dimension may exceed 65535" |
 | `DEPTHWISE_CONV_2D` with filter width 10, stride 5, multiplier 512 | 1-D strided conv on a long input | refused: "filter width (10)", "stride width (5)", "invalid multiplier (512)" |
 | `CONV_2D` with filter width 128, padding 64 | wide 1-D conv | refused: "filter width (128)", "invalid padding.left: 64" |
+| `nn.Conv1d` kernel 3, stride 2, 512→512, as litert-torch exports it (`CONV_2D` with `TRANSPOSE`s around it) | [1,8207,512] → [1,4103,512] | ok, 62.3 ms (CPU 144 ms), compile 90 s |
+| Same, kernel 2, stride 2 | [1,512,512] → [1,256,512] | ok, 3.7 ms (CPU 7.7 ms) |
+| Kernel-3 stride-2 conv as **two `FULLY_CONNECTED`s + `ADD`**: `out[t] = W0·x[2t] + W1·x[2t+1] + W2·x[2t+2]` = one FC ([W0 W1], 2C→C) on the frames reshaped into pairs, one FC (W2) on the pairs' first frames shifted by one (a `SLICE`) | [1,8207,512] → [1,4103,512] | ok, 29.6 ms (CPU 117 ms), compile 0.2 s: twice as fast as the native conv |
+| Kernel-2 stride-2 conv as `RESHAPE` into frame pairs + one FC 2C→C | [1,512,512] → [1,256,512] | ok, 3.5 ms |
+| Kernel-3 conv as im2col: `CONCATENATION` of the three taps along channels ([T,3C]) + one FC 3C→C | [1,8207,512] → [1,4103,512] | **compiles and runs but wrong (cosine 0.95; 0.66 inside a 6-layer stack)**. The same maths as two FCs + ADD (above) is right |
+| Wide grouped conv (kernel 128, 16 groups) as frame folding + `CONCATENATION` + FC with a Toeplitz weight | [1,512,1024] | **compiles and runs but wrong (cosine 0.77)** |
+| First conv on raw audio (kernel 10, stride 5, 1 channel → 512) as `RESHAPE` [T/5,5] + a narrow 5+5 `CONCATENATION` + FC 10→512 | [1,41040] → [1,8207,512] | ok (cosine 0.9999995), 12.2 ms, slower than the CPU (6.2 ms) |
+| LayerNorm written out on a long axis | [1,8207,512] | ok: 43.1 ms, compile 45 s; with FC means 36.5 ms, compile 0.1 s; split into 4 time chunks 50.4 ms |
 | VPU (`mtk-dsp`) with float16 / float32 | any float model | refused: "VPU: unsupported data type: Float16" (and Float32); int8 MobileNetV2 runs at 19.97 ms (slower than the CPU) |
 
 A full transformer layer (hidden 1024, 16 heads, FFN 4096, T = 512) built only from the accepted forms above
 (decomposed LayerNorm, sigmoid-form GELU, FC/CONV attention with runtime weights, per-head softmax) compiles
 as one partition and runs at 53–57 ms per layer on the MDLA against 315–320 ms on the 4-thread CPU, with
 cosine ≥ 0.99997 against float32.
+
+A wav2vec2-style conv feature encoder (after its first layer: six convs, kernels 3/3/3/3/2/2, stride 2, 512
+channels, each with a written-out LayerNorm and sigmoid GELU, then LayerNorm + FC 512→1024) on one tile of
+41,040 samples ([1,8207,512] → [1,128,1024]) compiles as one partition:
+
+| Form of the convs | MDLA | CPU | compile | cosine vs CPU |
+|---|---|---|---|---|
+| as exported (`CONV_2D` + `TRANSPOSE`) | 129 ms | 326 ms | 145 s | 0.99998 |
+| two FCs + ADD (k3), RESHAPE + FC (k2) | 65 ms | 263 ms | 24.7 s | 0.99998 |
+| im2col with `CONCATENATION` (k3) | 75 ms | 280 ms | 103 s | **0.66 (wrong)** |
+
+Peak RSS while compiling the 145 s form was 261 MB; the process held 182 MB after the load and 255 MB after
+the runs. With the first layer (raw audio, kernel 10, stride 5) and its LayerNorm on the same graph, the output
+drifted beyond fp16 noise (cosine 0.99928, max-abs 0.47 on values up to ~7) although both parts were right
+alone, so that layer stays on the CPU (a separate per-tile `.tflite` that feeds the NPU one). The same graph with
+FC means in every LayerNorm was refused ("SUB: EDMA: unsupported operation", "SUB: MDLA: Dimensions of input1
+and input2 should be equal or compatible") although one such LayerNorm compiled alone: probe composed graphs
+whole, not only their parts.
+
+In a speech model (Omnilingual ASR 300M CTC, 10.24 s windows cut into 4 tiles) this moved the feature encoder
+from 1.52 s to 0.53 s per window (0.28 s CPU for the first layer, 0.25 s MDLA for the rest) and the whole window
+from about 3.0 s to 2.0 s; on 44 test clips the word errors stayed the same except one word in one clip.
 
 One refused op fails the compile of the whole graph (no per-op fallback inside the Neuron compiler), so
 either change the export form or keep that op type on the CPU with patch 0003's `--npustt-exclude=...`.
